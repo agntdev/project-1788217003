@@ -144,6 +144,20 @@ export class ChatDO {
       }
     }
 
+    // Shared application catalog. It is deliberately one named Durable Object,
+    // so writes are serialized and the catalog never relies on a Redis key scan.
+    if (url.pathname === "/catalog") {
+      if (request.method === "GET" || request.method === "POST") {
+        return Response.json((await this.state.storage.get<unknown>("catalog")) ?? {
+          subjectIds: [], subjects: {}, sections: {}, files: {}, contacts: [],
+        });
+      }
+      if (request.method === "PUT") {
+        await this.state.storage.put("catalog", await request.json());
+        return new Response(null, { status: 204 });
+      }
+    }
+
     // Schedule a reminder + (re)arm the alarm to the earliest due one.
     if (url.pathname === "/remind" && request.method === "POST") {
       const rem = (await request.json()) as Reminder;

@@ -5,9 +5,9 @@
       {
         "expect": [
           {
-            "method": "sendMessage",
+            "method": "editMessageText",
             "payload": {
-              "text": "Access science subjects"
+              "text": "مواد الدراسة ليست جاهزة الآن. جرّب مرة أخرى بعد أن تُعدّ الإدارة المكتبة."
             }
           }
         ],
