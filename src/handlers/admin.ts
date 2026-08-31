@@ -1,15 +1,80 @@
 import { Composer } from "grammy";
+import type { Ctx } from "../bot.js";
+import { catalog, storageMessage, type StudyFile } from "../content-store.js";
+import { now } from "../clock.js";
+import { adminChatId, inlineButton, inlineKeyboard, requireOwner } from "../toolkit/index.js";
 
-// SCAFFOLD — generated from the bot blueprint BEFORE the agent runs.
-// Keep a LIVE registration (.command / .callbackQuery / …) so this feature is
-// never an empty stub. Replace the reply body with real logic + copy; if you
-// change the user-facing text, update tests/specs to match EXACTLY.
-// Do NOT rewrite src/bot.ts — buildBot() already auto-loads this module.
+const composer = new Composer<Ctx>();
+const adminKeys = () => inlineKeyboard([
+  [inlineButton("إضافة مادة", "adm:addsub"), inlineButton("إضافة قسم", "adm:addsec")],
+  [inlineButton("رفع ملف", "adm:addfile"), inlineButton("إدارة الملفات", "adm:files")],
+  [inlineButton("حذف مادة أو قسم", "adm:remove"), inlineButton("رسائل الطلاب", "adm:contacts")],
+  [inlineButton("العودة للقائمة", "menu:main")],
+]);
+const unavailable = (e: unknown) => e instanceof Error && e.message === "storage-unavailable";
+const clear = (ctx: Ctx) => { ctx.session.step = "idle"; ctx.session.subjectId = undefined; ctx.session.sectionId = undefined; ctx.session.fileId = undefined; ctx.session.upload = undefined; };
+const ask = (ctx: Ctx, text: string, step: NonNullable<Ctx["session"]>["step"]) => { ctx.session.step = step; return ctx.reply(text, { reply_markup: { force_reply: true, input_field_placeholder: "اكتب هنا" } } as any); };
+// Callback handlers answer their spinner before this guard; omit the callback
+// method here so a denied tap is never answered twice.
+async function owner(ctx: Ctx) {
+  return requireOwner({
+    env: (ctx as any).env,
+    from: ctx.from,
+    chat: ctx.chat,
+    reply: ctx.reply.bind(ctx) as any,
+  });
+}
+async function notify(ctx: Ctx, text: string) { const id = adminChatId(ctx as any); if (!id) return; try { await ctx.api.sendMessage(id, text); } catch { /* A blocked owner must not undo the content change. */ } }
+async function subjectsKeyboard(ctx: Ctx, prefix: string) { const all = [...await catalog.subjects(ctx, "science"), ...await catalog.subjects(ctx, "literature")]; return inlineKeyboard([...all.map(s => [inlineButton(s.name, `${prefix}:${s.id}`)]), [inlineButton("إلغاء", "adm:cancel")]]); }
+async function sectionsKeyboard(ctx: Ctx, subjectId: string, prefix: string) { const sections = await catalog.sections(ctx, subjectId); return inlineKeyboard([...sections.map(s => [inlineButton(s.name, `${prefix}:${s.id}`)]), [inlineButton("إلغاء", "adm:cancel")]]); }
+function fileKeyboard(files: StudyFile[], prefix: string) { return inlineKeyboard([...files.map(f => [inlineButton(f.title, `${prefix}:${f.id}`)]), [inlineButton("العودة للإدارة", "adm:open")]]); }
 
-const composer = new Composer();
+composer.command("admin", async (ctx) => { if (!(await owner(ctx))) return; clear(ctx); await ctx.reply("أهلًا بك. اختر ما تريد إدارته في المكتبة.", { reply_markup: adminKeys() }); });
+composer.callbackQuery("adm:open", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; clear(ctx); await ctx.editMessageText("أهلًا بك. اختر ما تريد إدارته في المكتبة.", { reply_markup: adminKeys() }); });
+composer.callbackQuery("adm:cancel", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; clear(ctx); await ctx.editMessageText("أُلغي التعديل.", { reply_markup: adminKeys() }); });
+composer.callbackQuery("adm:contacts", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { const messages = await catalog.takeContacts(ctx); const text = messages.length ? `هذه رسائل الطلاب الجديدة:\n\n${messages.map((m, i) => `${i + 1}. ${m.text}`).join("\n\n")}`.slice(0, 4096) : "لا توجد رسائل جديدة من الطلاب."; await ctx.editMessageText(text, { reply_markup: adminKeys() }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
 
-composer.command("admin", async (ctx) => {
-  await ctx.reply("Open admin content management interface");
+composer.callbackQuery("adm:addsub", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; ctx.session.step = "subject-name"; await ctx.reply("اكتب اسم المادة الجديدة.", { reply_markup: { force_reply: true, input_field_placeholder: "مثل: الفيزياء" } } as any); });
+composer.callbackQuery(/^adm:type:(science|literature)$/, async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; const type = ctx.match[1] as "science" | "literature"; const name = ctx.session.upload?.title; if (!name) { clear(ctx); await ctx.editMessageText("انتهت هذه الخطوة. ابدأ بإضافة مادة من جديد.", { reply_markup: adminKeys() }); return; } try { const subject = await catalog.addSubject(ctx, name, type); clear(ctx); await ctx.editMessageText(`أُضيفت مادة ${subject.name}. أضف قسمًا لها عندما تكون جاهزًا.`, { reply_markup: adminKeys() }); await notify(ctx, `أُضيفت مادة جديدة: ${subject.name}`); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+
+composer.callbackQuery("adm:addsec", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { await ctx.editMessageText("اختر المادة التي سيُضاف إليها القسم.", { reply_markup: await subjectsKeyboard(ctx, "adm:secsub") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:secsub:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; ctx.session.subjectId = ctx.callbackQuery.data.slice(11); await ctx.reply("اكتب اسم القسم الجديد.", { reply_markup: { force_reply: true, input_field_placeholder: "مثل: الكتاب المدرسي" } } as any); ctx.session.step = "section-name"; });
+
+composer.callbackQuery("adm:addfile", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { await ctx.editMessageText("اختر المادة التي ينتمي إليها الملف.", { reply_markup: await subjectsKeyboard(ctx, "adm:filesub") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:filesub:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; const id = ctx.callbackQuery.data.slice(12); try { ctx.session.subjectId = id; await ctx.editMessageText("اختر القسم الذي ينتمي إليه الملف.", { reply_markup: await sectionsKeyboard(ctx, id, "adm:filesec") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:filesec:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; ctx.session.sectionId = ctx.callbackQuery.data.slice(12); ctx.session.step = "file-document"; await ctx.reply("أرسل الملف الآن، وسنضيف عنوانه ووصفه بعد ذلك.", { reply_markup: { force_reply: true, input_field_placeholder: "أرسل ملفًا" } } as any); });
+
+composer.callbackQuery("adm:files", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { await ctx.editMessageText("اختر المادة لعرض ملفاتها.", { reply_markup: await subjectsKeyboard(ctx, "adm:listsub") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:listsub:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; const id = ctx.callbackQuery.data.slice(12); try { await ctx.editMessageText("اختر القسم.", { reply_markup: await sectionsKeyboard(ctx, id, "adm:listsec") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:listsec:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { const files = await catalog.files(ctx, ctx.callbackQuery.data.slice(12)); await ctx.editMessageText(files.length ? "اختر ملفًا لتعديله أو حذفه." : "لا توجد ملفات في هذا القسم بعد.", { reply_markup: files.length ? fileKeyboard(files, "adm:file") : adminKeys() }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:file:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; ctx.session.fileId = ctx.callbackQuery.data.slice(9); await ctx.editMessageText("ماذا تريد أن تفعل بالملف؟", { reply_markup: inlineKeyboard([[inlineButton("تعديل العنوان", "adm:edittitle"), inlineButton("تعديل الوصف", "adm:editdesc")], [inlineButton("حذف الملف", "adm:deletefile")], [inlineButton("العودة للإدارة", "adm:open")]]) }); });
+composer.callbackQuery("adm:edittitle", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; await ask(ctx, "اكتب العنوان الجديد للملف.", "edit-title"); });
+composer.callbackQuery("adm:editdesc", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; await ask(ctx, "اكتب الوصف الجديد للملف.", "edit-description"); });
+composer.callbackQuery("adm:deletefile", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; const fileId = ctx.session.fileId; if (!fileId) { await ctx.editMessageText("اختر ملفًا أولًا.", { reply_markup: adminKeys() }); return; } await ctx.editMessageText("سيُحذف الملف من المكتبة. أكّد الحذف.", { reply_markup: inlineKeyboard([[inlineButton("تأكيد الحذف", "adm:deleteyes")], [inlineButton("إلغاء", "adm:cancel")]]) }); });
+composer.callbackQuery("adm:deleteyes", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { const file = ctx.session.fileId ? await catalog.deleteFile(ctx, ctx.session.fileId) : undefined; clear(ctx); await ctx.editMessageText(file ? "حُذف الملف من المكتبة." : "لم نعثر على الملف.", { reply_markup: adminKeys() }); if (file) await notify(ctx, `حُذف ملف من المكتبة: ${file.title}`); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+
+composer.callbackQuery("adm:remove", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; await ctx.editMessageText("اختر ما تريد حذفه. الحذف نهائي.", { reply_markup: inlineKeyboard([[inlineButton("حذف مادة", "adm:pickdelsub"), inlineButton("حذف قسم", "adm:pickdelsec")], [inlineButton("إلغاء", "adm:cancel")]]) }); });
+composer.callbackQuery("adm:pickdelsub", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { await ctx.editMessageText("اختر المادة التي تريد حذفها.", { reply_markup: await subjectsKeyboard(ctx, "adm:delsub") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.callbackQuery("adm:pickdelsec", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { await ctx.editMessageText("اختر المادة التي يوجد فيها القسم.", { reply_markup: await subjectsKeyboard(ctx, "adm:delsecsub") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:delsecsub:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { await ctx.editMessageText("اختر القسم الذي تريد حذفه.", { reply_markup: await sectionsKeyboard(ctx, ctx.callbackQuery.data.slice(14), "adm:delsec") }); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:delsec:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; ctx.session.sectionId = ctx.callbackQuery.data.slice(11); await ctx.editMessageText("سيُحذف القسم وكل ملفاته. أكّد الحذف.", { reply_markup: inlineKeyboard([[inlineButton("تأكيد الحذف", "adm:delsecyes")], [inlineButton("إلغاء", "adm:cancel")]]) }); });
+composer.callbackQuery("adm:delsecyes", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { const item = ctx.session.sectionId ? await catalog.deleteSection(ctx, ctx.session.sectionId) : undefined; clear(ctx); await ctx.editMessageText(item ? "حُذف القسم وملفاته." : "لم نعثر على القسم.", { reply_markup: adminKeys() }); if (item) await notify(ctx, `حُذف قسم من المكتبة: ${item.name}`); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+composer.on("callback_query:data", async (ctx, next) => { if (!ctx.callbackQuery.data.startsWith("adm:delsub:")) return next(); await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; ctx.session.subjectId = ctx.callbackQuery.data.slice(11); await ctx.editMessageText("سيُحذف كل ما داخل هذه المادة. أكّد الحذف.", { reply_markup: inlineKeyboard([[inlineButton("تأكيد الحذف", "adm:delsubyes")], [inlineButton("إلغاء", "adm:cancel")]]) }); });
+composer.callbackQuery("adm:delsubyes", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; try { const item = ctx.session.subjectId ? await catalog.deleteSubject(ctx, ctx.session.subjectId) : undefined; clear(ctx); await ctx.editMessageText(item ? "حُذفت المادة وأقسامها." : "لم نعثر على المادة.", { reply_markup: adminKeys() }); if (item) await notify(ctx, `حُذفت مادة من المكتبة: ${item.name}`); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
+
+composer.on("message", async (ctx, next) => {
+  const step = ctx.session.step;
+  if (!step || step === "idle") return next();
+  if (!(await owner(ctx))) return;
+  if (step === "file-document") { const doc = ctx.message?.document; if (!doc) { await ctx.reply("أرسل ملفًا حتى نتمكن من إضافته."); return; } ctx.session.upload = { telegramFileId: doc.file_id, fileType: doc.mime_type ?? doc.file_name?.split(".").pop() ?? "document" }; await ask(ctx, "اكتب عنوان الملف.", "file-title"); return; }
+  if (!ctx.message?.text) return;
+  const text = ctx.message.text.trim();
+  if (!text) { await ctx.reply("اكتب نصًا قصيرًا للمتابعة."); return; }
+  if (step === "subject-name") { ctx.session.upload = { telegramFileId: "", fileType: "", title: text }; await ctx.reply("اختر نوع المادة.", { reply_markup: inlineKeyboard([[inlineButton("علمية", "adm:type:science"), inlineButton("أدبية", "adm:type:literature")], [inlineButton("إلغاء", "adm:cancel")]]) }); return; }
+  if (step === "section-name") { try { const section = ctx.session.subjectId ? await catalog.addSection(ctx, ctx.session.subjectId, text) : undefined; clear(ctx); await ctx.reply(section ? `أُضيف قسم ${section.name}.` : "لم نعثر على المادة. ابدأ من جديد.", { reply_markup: adminKeys() }); if (section) await notify(ctx, `أُضيف قسم جديد: ${section.name}`); } catch (e) { if (unavailable(e)) await ctx.reply(storageMessage()); else throw e; } return; }
+  if (step === "file-title") { if (ctx.session.upload) ctx.session.upload.title = text; await ask(ctx, "اكتب وصفًا قصيرًا للملف.", "file-description"); return; }
+  if (step === "file-description") { if (ctx.session.upload) ctx.session.upload.description = text; ctx.session.step = "file-confirm"; await ctx.reply(`هل تريد إضافة ملف "${ctx.session.upload?.title}"؟`, { reply_markup: inlineKeyboard([[inlineButton("إضافة الملف", "adm:savefile")], [inlineButton("إلغاء", "adm:cancel")]]) }); return; }
+  if (step === "edit-title" || step === "edit-description") { try { const updated = ctx.session.fileId ? await catalog.updateFile(ctx, ctx.session.fileId, step === "edit-title" ? { title: text } : { description: text }) : undefined; clear(ctx); await ctx.reply(updated ? "حُفظ التعديل." : "لم نعثر على الملف.", { reply_markup: adminKeys() }); if (updated) await notify(ctx, `عُدلت بيانات ملف: ${updated.title}`); } catch (e) { if (unavailable(e)) await ctx.reply(storageMessage()); else throw e; } }
 });
-
+composer.callbackQuery("adm:savefile", async (ctx) => { await ctx.answerCallbackQuery(); if (!(await owner(ctx))) return; const u = ctx.session.upload; try { const file = u && ctx.session.sectionId && u.title && u.description ? await catalog.addFile(ctx, { sectionId: ctx.session.sectionId, telegramFileId: u.telegramFileId, fileType: u.fileType, title: u.title, description: u.description, uploadDate: now().toISOString(), adminSource: String(ctx.from?.id ?? "") }) : undefined; clear(ctx); await ctx.editMessageText(file ? "أُضيف الملف وأصبح متاحًا للطلاب." : "انتهت هذه الخطوة. ابدأ رفع الملف من جديد.", { reply_markup: adminKeys() }); if (file) await notify(ctx, `رُفع ملف جديد: ${file.title}`); } catch (e) { if (unavailable(e)) await ctx.editMessageText(storageMessage(), { reply_markup: adminKeys() }); else throw e; } });
 export default composer;

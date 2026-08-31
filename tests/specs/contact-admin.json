@@ -5,9 +5,9 @@
       {
         "expect": [
           {
-            "method": "sendMessage",
+            "method": "editMessageText",
             "payload": {
-              "text": "Send message to admin"
+              "text": "التواصل مع الإدارة غير مُعدّ بعد. جرّب لاحقًا."
             }
           }
         ],

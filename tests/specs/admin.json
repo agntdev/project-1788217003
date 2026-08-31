@@ -7,7 +7,7 @@
           {
             "method": "sendMessage",
             "payload": {
-              "text": "Open admin content management interface"
+              "text": "Owner access isn't set up yet."
             }
           }
         ],
