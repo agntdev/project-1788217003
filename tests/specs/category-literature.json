@@ -1,0 +1,20 @@
+[
+  {
+    "name": "المواد الأدبية",
+    "steps": [
+      {
+        "expect": [
+          {
+            "method": "sendMessage",
+            "payload": {
+              "text": "Access literature subjects"
+            }
+          }
+        ],
+        "send": {
+          "callback": "category:literature"
+        }
+      }
+    ]
+  }
+]
